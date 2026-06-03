@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: kalkireddy/demo-node-app
+  repository: sujeetdevops05/demo-node-app
   tag: "v1.0.1"
   pullPolicy: IfNotPresent
 
