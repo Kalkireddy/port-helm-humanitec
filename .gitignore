@@ -1,0 +1,30 @@
+# Node
+node_modules/
+npm-debug.log*
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Kubernetes / AWS credentials
+kubeconfig
+kubeconfig.yaml
+*-kubeconfig.yaml
+*.pem
+*.key
+.aws/
+
+# Helm
+*.tgz
+charts/*/charts/
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log

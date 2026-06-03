@@ -1,0 +1,23 @@
+replicaCount: 1
+
+image:
+  repository: kalkireddy/demo-node-app
+  tag: "v1.0.1"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 50m
+    memory: 64Mi
+
+env:
+  APP_ENV: dev
+  APP_VERSION: v1.0.1
