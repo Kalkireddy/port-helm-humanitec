@@ -1,0 +1,234 @@
+name: Deploy Helm Application
+
+on:
+  workflow_dispatch:
+    inputs:
+      port_run_id:
+        description: 'Port Run ID for status reporting'
+        required: true
+        type: string
+      service_name:
+        description: 'Service name (must match Humanitec app ID)'
+        required: true
+        type: string
+      environment:
+        description: 'Target environment (dev or prod)'
+        required: true
+        type: string
+      image_tag:
+        description: 'Docker image tag to deploy'
+        required: true
+        type: string
+      namespace:
+        description: 'Kubernetes namespace'
+        required: true
+        type: string
+      chart_name:
+        description: 'Helm chart name under /charts directory'
+        required: true
+        type: string
+
+jobs:
+  validate-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ─── STEP 1: Notify Port — workflow has started ───────────────────────
+      - name: Notify Port - Started
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: "Starting deployment of ${{ inputs.service_name }}:${{ inputs.image_tag }} to ${{ inputs.environment }}"
+
+      # ─── STEP 2: Checkout repository ──────────────────────────────────────
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ─── STEP 3: Install Helm ─────────────────────────────────────────────
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'v3.14.0'
+
+      # ─── STEP 4: Helm Lint validation ─────────────────────────────────────
+      - name: Helm Lint
+        run: |
+          echo "Running helm lint on chart: ${{ inputs.chart_name }}"
+          helm lint ./charts/${{ inputs.chart_name }}
+
+      # ─── STEP 5: Helm Template dry-run ────────────────────────────────────
+      - name: Helm Template Dry Run
+        run: |
+          echo "Running helm template dry run"
+          helm template ${{ inputs.service_name }} ./charts/${{ inputs.chart_name }} \
+            --namespace ${{ inputs.namespace }} \
+            --set image.tag=${{ inputs.image_tag }} \
+            --set env.APP_ENV=${{ inputs.environment }} \
+            --set env.APP_VERSION=${{ inputs.image_tag }}
+
+      # ─── STEP 6: Notify Port — validation passed ──────────────────────────
+      - name: Notify Port - Validation Passed
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: "Helm validation passed. Sending deployment request to Humanitec."
+
+      # ─── STEP 7: Create Humanitec Delta ───────────────────────────────────
+      - name: Create Humanitec Delta
+        id: create_delta
+        run: |
+          echo "Creating deployment delta in Humanitec..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.humanitec.io/orgs/${{ secrets.HUMANITEC_ORG }}/apps/${{ inputs.service_name }}/deltas" \
+            -H "Authorization: Bearer ${{ secrets.HUMANITEC_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "modules": {
+                "update": {
+                  "${{ inputs.service_name }}": [
+                    {
+                      "op": "replace",
+                      "path": "/spec/containers/${{ inputs.service_name }}/image",
+                      "value": "${{ secrets.DOCKER_HUB_USERNAME }}/demo-node-app:${{ inputs.image_tag }}"
+                    },
+                    {
+                      "op": "replace",
+                      "path": "/spec/containers/${{ inputs.service_name }}/variables/APP_VERSION",
+                      "value": "${{ inputs.image_tag }}"
+                    }
+                  ]
+                }
+              }
+            }')
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "ERROR: Failed to create Humanitec delta"
+            exit 1
+          fi
+
+          DELTA_ID=$(echo "$BODY" | tr -d '"')
+
+          if [ -z "$DELTA_ID" ]; then
+            echo "ERROR: Delta ID not found in response"
+            exit 1
+          fi
+
+          echo "Delta created successfully: $DELTA_ID"
+          echo "delta_id=$DELTA_ID" >> $GITHUB_OUTPUT
+
+      # ─── STEP 8: Trigger Deployment in Humanitec ──────────────────────────
+      - name: Deploy Delta to Humanitec
+        id: deploy
+        run: |
+          echo "Triggering deployment in Humanitec..."
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+            "https://api.humanitec.io/orgs/${{ secrets.HUMANITEC_ORG }}/apps/${{ inputs.service_name }}/envs/${{ inputs.environment }}/deploys" \
+            -H "Authorization: Bearer ${{ secrets.HUMANITEC_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"delta_id\": \"${{ steps.create_delta.outputs.delta_id }}\",
+              \"comment\": \"Deployed via Port self-service: ${{ inputs.service_name }}:${{ inputs.image_tag }}\"
+            }")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+          BODY=$(echo "$RESPONSE" | head -n-1)
+
+          echo "HTTP Status: $HTTP_CODE"
+          echo "Response: $BODY"
+
+          if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
+            echo "ERROR: Failed to trigger deployment"
+            exit 1
+          fi
+
+          DEPLOY_ID=$(echo "$BODY" | python3 -c "import sys,json; print(json.load(sys.stdin)['id'])")
+
+          if [ -z "$DEPLOY_ID" ]; then
+            echo "ERROR: Deploy ID not found in response"
+            exit 1
+          fi
+
+          echo "Deployment triggered: $DEPLOY_ID"
+          echo "deploy_id=$DEPLOY_ID" >> $GITHUB_OUTPUT
+
+      # ─── STEP 9: Notify Port — deployment triggered ───────────────────────
+      - name: Notify Port - Deployment Triggered
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          logMessage: "Deployment triggered in Humanitec (ID: ${{ steps.deploy.outputs.deploy_id }}). Waiting for completion..."
+
+      # ─── STEP 10: Poll Deployment Status ──────────────────────────────────
+      - name: Poll Deployment Status
+        run: |
+          echo "Polling deployment status — checking every 15 seconds, max 5 minutes..."
+
+          for i in {1..20}; do
+            STATUS=$(curl -s \
+              "https://api.humanitec.io/orgs/${{ secrets.HUMANITEC_ORG }}/apps/${{ inputs.service_name }}/envs/${{ inputs.environment }}/deploys/${{ steps.deploy.outputs.deploy_id }}" \
+              -H "Authorization: Bearer ${{ secrets.HUMANITEC_TOKEN }}" \
+              | python3 -c "import sys,json; print(json.load(sys.stdin).get('status','unknown'))")
+
+            echo "Attempt $i/20 — Status: $STATUS"
+
+            if [ "$STATUS" = "succeeded" ]; then
+              echo "Deployment succeeded!"
+              exit 0
+            fi
+
+            if [ "$STATUS" = "failed" ] || [ "$STATUS" = "timeout" ]; then
+              echo "Deployment failed with status: $STATUS"
+              exit 1
+            fi
+
+            sleep 15
+          done
+
+          echo "ERROR: Timeout — deployment did not complete within 5 minutes"
+          exit 1
+
+      # ─── STEP 11: Notify Port — Success ───────────────────────────────────
+      - name: Notify Port - Success
+        if: success()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: SUCCESS
+          logMessage: "Deployment successful — ${{ inputs.service_name }}:${{ inputs.image_tag }} is live in ${{ inputs.environment }}"
+
+      # ─── STEP 12: Notify Port — Failure ───────────────────────────────────
+      - name: Notify Port - Failure
+        if: failure()
+        uses: port-labs/port-github-action@v1
+        with:
+          clientId: ${{ secrets.PORT_CLIENT_ID }}
+          clientSecret: ${{ secrets.PORT_CLIENT_SECRET }}
+          baseUrl: https://api.getport.io
+          operation: PATCH_RUN
+          runId: ${{ inputs.port_run_id }}
+          status: FAILURE
+          logMessage: "Deployment failed — ${{ inputs.service_name }}:${{ inputs.image_tag }} to ${{ inputs.environment }} did not complete"
